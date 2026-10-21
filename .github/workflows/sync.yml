@@ -1,0 +1,47 @@
+name: Base VAT sync
+
+# Uruchamiany z zewnatrz (workflow_dispatch):
+#  - przez Shopify Flow po kazdym nowym zamowieniu (z numerem zamowienia),
+#  - przez cron-job.org co 5 minut jako siatka bezpieczenstwa (bez numeru zamowienia = skan ostatnich godzin).
+# Celowo bez wlasnego "schedule": harmonogram GitHuba bywa opozniony o godziny
+# i jest wylaczany po 60 dniach braku aktywnosci repozytorium.
+on:
+  workflow_dispatch:
+    inputs:
+      order_name:
+        description: "Numer zamowienia w Shopify, np. #13406 (puste = skan ostatnich godzin)"
+        required: false
+        default: ""
+      shop:
+        description: "ehair albo herflow (puste = oba sklepy)"
+        required: false
+        default: ""
+      dry_run:
+        description: "1 = tylko podglad (nic nie zapisuje w Base), 0 = zapisuje"
+        required: false
+        default: "1"
+
+concurrency:
+  group: base-vat-sync-${{ github.event.inputs.order_name || 'scan' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Uruchom synchronizacje
+        run: python3 sync.py
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || '1' }}
+          ONLY_ORDER: ${{ github.event.inputs.order_name }}
+          ONLY_SHOP: ${{ github.event.inputs.shop }}
+          BASELINKER_TOKEN: ${{ secrets.BASELINKER_TOKEN }}
+          EHAIR_CLIENT_ID: ${{ secrets.EHAIR_CLIENT_ID }}
+          EHAIR_CLIENT_SECRET: ${{ secrets.EHAIR_CLIENT_SECRET }}
+          HERFLOW_CLIENT_ID: ${{ secrets.HERFLOW_CLIENT_ID }}
+          HERFLOW_CLIENT_SECRET: ${{ secrets.HERFLOW_CLIENT_SECRET }}
