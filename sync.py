@@ -161,6 +161,7 @@ def shopify_orders(shop, token, query):
                 "created_at": n["createdAt"],
                 "vat": extract_vat(msgs),
                 "events": len(msgs),
+                "msgs": msgs,
             })
         if not data["pageInfo"]["hasNextPage"]:
             break
@@ -272,6 +273,12 @@ def run_shop(key, only_order_name=None):
         query = f"created_at:>={since}"
     found = shopify_orders(shop, token, query)
     log(f"Zamowien znalezionych w Shopify: {len(found)} (wpisow na osi czasu: {sum(o['events'] for o in found)})")
+    if only_order_name:
+        for o in found:
+            for m in o["msgs"]:
+                if re.search(r"VAT|obci", m, re.I):
+                    masked = re.sub(r"\b[A-Z]{2}[ A-Z0-9]*\d[A-Z0-9]*\b", "<ID>", re.sub(r"<[^>]+>", "", m))
+                    log("DIAG: " + ascii(masked))
     orders = [o for o in found if o["vat"]]
     log(f"Zamowien z waznym numerem VAT w Shopify: {len(orders)}")
     if not orders:
