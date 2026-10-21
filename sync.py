@@ -160,6 +160,7 @@ def shopify_orders(shop, token, query):
                 "name": n["name"],
                 "created_at": n["createdAt"],
                 "vat": extract_vat(msgs),
+                "events": len(msgs),
             })
         if not data["pageInfo"]["hasNextPage"]:
             break
@@ -269,7 +270,9 @@ def run_shop(key, only_order_name=None):
     else:
         since = (datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
         query = f"created_at:>={since}"
-    orders = [o for o in shopify_orders(shop, token, query) if o["vat"]]
+    found = shopify_orders(shop, token, query)
+    log(f"Zamowien znalezionych w Shopify: {len(found)} (wpisow na osi czasu: {sum(o['events'] for o in found)})")
+    orders = [o for o in found if o["vat"]]
     log(f"Zamowien z waznym numerem VAT w Shopify: {len(orders)}")
     if not orders:
         return 0
