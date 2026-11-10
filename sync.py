@@ -8,7 +8,8 @@ i ustawia stawke 0% (odwrotne obciazenie), tak jak robi to regula WDT w Base.
 Druga sciezka (komentarz klienta): jesli zamowienie jedzie do kraju UE (nie PL), pole NIP
 w Base jest puste, a w komentarzu klienta (aplikacja B2B) jest numer w linii
 "EU VAT Validation: ...", skrypt sam sprawdza numer w VIES (nie ufa statusowi z aplikacji)
-i dopiero wtedy wpisuje go do pola NIP. Stawke VAT wtedy ustawia regula WDT w Base.
+i dopiero wtedy wpisuje go do pola NIP oraz ustawia VAT 0% na pozycjach (regula WDT w Base
+uruchamia sie tylko przy pobraniu zamowienia, wiec pozniejszego wpisu NIP sama nie obsluzy).
 Przy numerze nieprawidlowym albo gdy VIES nie odpowiada - nic nie zmienia, tylko loguje.
 
 Zasady bezpieczenstwa:
@@ -345,13 +346,25 @@ def process_comment(order, base_order, matched_by):
     if status == "nieaktywny":
         return f"{name}: numer z komentarza jest NIEPRAWIDLOWY w VIES - nic nie zmieniam, do sprawdzenia recznie"
 
-    plan = (f"{name}: NIP z komentarza klienta -> pole NIP w Base (kraj dostawy {country}, "
-            f"prefiks {vat[:2]}, {len(vat) - 2} znakow, VIES: aktywny; stawke VAT ustawi regula WDT w Base) "
+    # Regula WDT w Base uruchamia sie tylko przy pobraniu zamowienia (wyzwalacz "Pobrano zamowienie"),
+    # wiec po pozniejszym wpisie NIP stawka sama sie nie zmieni - ustawiamy 0% sami,
+    # tak jak w sciezce z Shopify.
+    to_fix = [p for p in base_order.get("products", []) if float(p.get("tax_rate", 0)) != 0.0]
+    plan = (f"{name}: NIP z komentarza klienta -> pole NIP w Base + VAT 0% na {len(to_fix)} poz. "
+            f"(kraj dostawy {country}, prefiks {vat[:2]}, {len(vat) - 2} znakow, VIES: aktywny) "
             f"(dopasowanie po {matched_by})")
     if DRY_RUN:
         return "[PODGLAD] " + plan
 
-    note = f"{MARKER} NIP z komentarza klienta (VIES OK)"
+    # Najpierw stawki, na koncu NIP: gdyby cos po drodze zawiodlo, zamowienie dalej nie ma NIP
+    # i przy nastepnym przebiegu skrypt sprobuje jeszcze raz.
+    for p in to_fix:
+        base_call("setOrderProductFields", {
+            "order_id": base_order["order_id"],
+            "order_product_id": p["order_product_id"],
+            "tax_rate": 0,
+        })
+    note = f"{MARKER} NIP z komentarza klienta (VIES OK), VAT 0%"
     new_comments = (comments + "\n" if comments else "") + note
     fields = {"order_id": base_order["order_id"], "invoice_nip": vat}
     if len(new_comments) <= 200:  # limit pola admin_comments w API Base
