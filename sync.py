@@ -5,6 +5,12 @@ base-vat-sync
 Przepisuje numer VAT UE zweryfikowany w Shopify (Shopify Tax / VIES) do zamowienia w Base
 i ustawia stawke 0% (odwrotne obciazenie), tak jak robi to regula WDT w Base.
 
+Druga sciezka (komentarz klienta): jesli zamowienie jedzie do kraju UE (nie PL), pole NIP
+w Base jest puste, a w komentarzu klienta (aplikacja B2B) jest numer w linii
+"EU VAT Validation: ...", skrypt sam sprawdza numer w VIES (nie ufa statusowi z aplikacji)
+i dopiero wtedy wpisuje go do pola NIP. Stawke VAT wtedy ustawia regula WDT w Base.
+Przy numerze nieprawidlowym albo gdy VIES nie odpowiada - nic nie zmienia, tylko loguje.
+
 Zasady bezpieczenstwa:
   * Repozytorium jest PUBLICZNE, wiec w logach NIE wypisujemy zadnych danych klientow
     (imion, adresow, e-maili, numerow VAT). Tylko numery zamowien i liczniki.
@@ -261,6 +267,99 @@ def process(order, base_order, matched_by):
     return "[ZAPISANO] " + plan
 
 
+# ----------------------------------------------------------------------------
+# NIP tylko w komentarzu klienta + sprawdzenie w VIES
+# ----------------------------------------------------------------------------
+# Kraje UE bez Polski (kody jak w Base). Dla tych krajow regula WDT w Base ma sens.
+EU_COUNTRIES = {
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU",
+    "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PT", "RO", "SK", "SI", "ES", "SE",
+}
+# Prefiksy numerow VAT UE (Grecja ma w numerze VAT "EL", a nie "GR"). Bez "PL".
+VAT_PREFIXES = {"EL" if c == "GR" else c for c in EU_COUNTRIES}
+
+COMMENT_VAT_RE = re.compile(r"EU VAT Validation:\s*([A-Za-z]{2}[ .\-]?[A-Za-z0-9]{2,12})(?![A-Za-z0-9])",
+                            re.IGNORECASE)
+VIES_URL = "https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number"
+
+
+def extract_comment_vat(user_comments):
+    """Z komentarza klienta wyciaga numer z linii 'EU VAT Validation: ...' (np. ESB12345678) albo None."""
+    if not user_comments:
+        return None
+    m = COMMENT_VAT_RE.search(user_comments)
+    if not m:
+        return None
+    vat = re.sub(r"[^A-Za-z0-9]", "", m.group(1)).upper()
+    if len(vat) < 4 or not any(ch.isdigit() for ch in vat[2:]):
+        return None  # np. "EU VAT Validation: Pending" - to nie jest numer
+    return vat
+
+
+def vies_check(vat):
+    """Pyta publiczne API VIES o numer (z prefiksem kraju). Zwraca jedno z:
+    'aktywny', 'nieaktywny', 'niedostepny' (blad albo brak odpowiedzi VIES).
+    Zapis do Base nastepuje wylacznie przy 'aktywny'. Odpowiedzi VIES nie logujemy."""
+    prefix, number = vat[:2], vat[2:]
+    for attempt in range(3):
+        res = None
+        try:
+            res = http_json(VIES_URL, {"countryCode": prefix, "vatNumber": number})
+        except Exception:  # blad sieci/serwera VIES - sprobuj jeszcze raz
+            res = None
+        if res is not None:
+            err = res.get("userError")
+            if res.get("actionSucceed") is False or (err and err not in ("VALID", "INVALID", "INVALID_INPUT")):
+                res = None  # VIES zglasza problem po swojej stronie (np. serwer kraju nie odpowiada)
+            elif res.get("valid") is True:
+                return "aktywny"
+            elif res.get("valid") is False:
+                return "nieaktywny"
+        if attempt < 2:
+            time.sleep(3)
+    return "niedostepny"
+
+
+def process_comment(order, base_order, matched_by):
+    """Zamowienie bez NIP w Base, ale z numerem VAT UE w komentarzu klienta.
+    Zwraca opis akcji albo None, gdy zamowienie nie spelnia warunkow (wtedy nic nie logujemy).
+    W logach (repo jest publiczne) nie ma numeru VAT ani danych klienta."""
+    name = order["name"]
+    comments = base_order.get("admin_comments") or ""
+    if MARKER in comments:
+        return None
+    country = (base_order.get("delivery_country_code") or "").upper()
+    if country not in EU_COUNTRIES:
+        return None
+    if (base_order.get("invoice_nip") or "").strip():
+        return None
+    vat = extract_comment_vat(base_order.get("user_comments"))
+    if not vat:
+        return None
+
+    if vat[:2] not in VAT_PREFIXES:
+        return f"{name}: numer z komentarza ma prefiks spoza UE-bez-PL ({vat[:2]}) - nic nie zmieniam, do sprawdzenia recznie"
+    status = vies_check(vat)
+    if status == "niedostepny":
+        return f"{name}: VIES nie odpowiada - nic nie zmieniam, sprobuje przy nastepnym przebiegu"
+    if status == "nieaktywny":
+        return f"{name}: numer z komentarza jest NIEPRAWIDLOWY w VIES - nic nie zmieniam, do sprawdzenia recznie"
+
+    plan = (f"{name}: NIP z komentarza klienta -> pole NIP w Base (kraj dostawy {country}, "
+            f"prefiks {vat[:2]}, {len(vat) - 2} znakow, VIES: aktywny; stawke VAT ustawi regula WDT w Base) "
+            f"(dopasowanie po {matched_by})")
+    if DRY_RUN:
+        return "[PODGLAD] " + plan
+
+    note = f"{MARKER} NIP z komentarza klienta (VIES OK)"
+    new_comments = (comments + "\n" if comments else "") + note
+    fields = {"order_id": base_order["order_id"], "invoice_nip": vat}
+    if len(new_comments) <= 200:  # limit pola admin_comments w API Base
+        fields["admin_comments"] = new_comments
+    base_call("setOrderFields", fields)
+    return "[ZAPISANO] " + plan
+
+
 def run_shop(key, only_order_name=None):
     shop = SHOPS[key]
     log(f"== {key} ({'PODGLAD' if DRY_RUN else 'ZAPIS'}) ==")
@@ -274,12 +373,14 @@ def run_shop(key, only_order_name=None):
     log(f"Zamowien znalezionych w Shopify: {len(found)} (wpisow na osi czasu: {sum(o['events'] for o in found)})")
     orders = [o for o in found if o["vat"]]
     log(f"Zamowien z waznym numerem VAT w Shopify: {len(orders)}")
-    if not orders:
+    if not found:
         return 0
 
+    # Zamowienia bez wpisu o VAT w Shopify tez trzeba obejrzec w Base: numer VAT UE
+    # moze byc tylko w komentarzu klienta (sciezka process_comment).
     source_id = base_shop_id(shop["base_name"])
     deadline = time.time() + (WAIT_SECONDS if only_order_name else 0)
-    pending = list(orders)
+    pending = list(found)
     while True:
         oldest = min(datetime.fromisoformat(o["created_at"].replace("Z", "+00:00")) for o in pending)
         base_list = base_orders(source_id, int(oldest.timestamp()) - 3600)
@@ -289,13 +390,16 @@ def run_shop(key, only_order_name=None):
             if b is None:
                 still.append(o)
                 continue
-            log(process(o, b, field))
+            msg = process(o, b, field) if o["vat"] else process_comment(o, b, field)
+            if msg:
+                log(msg)
         pending = still
         if not pending or time.time() >= deadline:
             break
         time.sleep(POLL_SECONDS)
     for o in pending:
-        log(f"{o['name']}: brak w Base (jeszcze nie pobrane albo nie dopasowano) - sprobuje przy nastepnym przebiegu")
+        if o["vat"]:
+            log(f"{o['name']}: brak w Base (jeszcze nie pobrane albo nie dopasowano) - sprobuje przy nastepnym przebiegu")
     return 0
 
 
